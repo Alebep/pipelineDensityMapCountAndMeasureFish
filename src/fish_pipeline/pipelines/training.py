@@ -7,7 +7,7 @@ from math import exp
 from random import Random
 from typing import List, Sequence, Tuple
 
-from ..models.density import BaseDensityModel, LFCNetLikeDensityModel, TrainingSample
+from ..models.density import BaseDensityModel, CSRNetDensityModel, LFCNetLikeDensityModel, TrainingSample
 from .base import Pipeline
 
 Matrix = List[List[float]]
@@ -107,7 +107,7 @@ class DensityModelTrainingPipeline(Pipeline):
         model: BaseDensityModel | None = None,
         config: TrainingConfig | None = None,
     ) -> None:
-        self.model = model or LFCNetLikeDensityModel()
+        self.model = model or CSRNetDensityModel()
         self.config = config or TrainingConfig()
 
     def run(self) -> TrainingReport:
