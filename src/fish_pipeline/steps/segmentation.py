@@ -1,48 +1,48 @@
-"""Instance segmentation powered by promptable models."""
+"""Instance segmentation powered by SAM-HQ."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections import deque
 from dataclasses import dataclass
+from importlib import metadata
+from pathlib import Path
 from typing import Iterable, List, Tuple
+
+try:  # pragma: no cover - optional dependency guard
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
+    np = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency guard
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
+    torch = None  # type: ignore[assignment]
+
+if torch is not None:  # pragma: no cover - optional dependency guard
+    try:
+        from segment_anything_hq import SamPredictor, sam_model_registry
+    except ModuleNotFoundError:  # pragma: no cover - dependency missing
+        SamPredictor = None  # type: ignore[assignment]
+        sam_model_registry = {}
+    except Exception:  # pragma: no cover - other import failures
+        SamPredictor = None  # type: ignore[assignment]
+        sam_model_registry = {}
+else:  # pragma: no cover - torch not available
+    SamPredictor = None  # type: ignore[assignment]
+    sam_model_registry = {}
 
 from .peaks import Peak
 
 Mask = List[List[bool]]
 
 
-def _create_empty_mask(height: int, width: int) -> Mask:
-    return [[False for _ in range(width)] for _ in range(height)]
-
-
-def _circle_mask(center_x: int, center_y: int, radius: int, height: int, width: int) -> Mask:
-    mask = _create_empty_mask(height, width)
-    radius_sq = radius * radius
-    for y in range(max(center_y - radius, 0), min(center_y + radius + 1, height)):
-        for x in range(max(center_x - radius, 0), min(center_x + radius + 1, width)):
-            if (x - center_x) ** 2 + (y - center_y) ** 2 <= radius_sq:
-                mask[y][x] = True
-    return mask
-
-
-def _mask_area(mask: Mask) -> int:
-    return sum(1 for row in mask for value in row if value)
-
-
-def _mean_intensity(mask: Mask, image: List[List[float]]) -> float:
-    total = 0.0
-    count = 0
-    for y, row in enumerate(mask):
-        for x, is_foreground in enumerate(row):
-            if is_foreground:
-                total += image[y][x]
-                count += 1
-    return total / count if count else 0.0
-
-
-def _within_bounds(x: int, y: int, width: int, height: int) -> bool:
-    return 0 <= x < width and 0 <= y < height
+def _package_version() -> str:
+    try:  # pragma: no cover - optional dependency metadata
+        return metadata.version("segment-anything-hq")
+    except metadata.PackageNotFoundError:  # type: ignore[attr-defined]
+        return "unavailable"
+    except Exception:
+        return "unknown"
 
 
 @dataclass
@@ -68,39 +68,42 @@ class BasePromptedSegmenter(ABC):
 
 
 class SAMHQSegmenter(BasePromptedSegmenter):
-    """Simplified SAM-HQ style promptable segmenter."""
+    """Wrapper around the official SAM-HQ predictor."""
 
     def __init__(
         self,
-        intensity_ratio: float = 0.45,
-        max_radius: int = 18,
-        dilation_radius: int = 2,
-        min_area: int = 24,
-        min_radius: int = 6,
-        model_version: str = "0.5.0",
+        checkpoint_path: str | Path | None = None,
+        model_type: str = "vit_b",
+        device: str | None = None,
+        multimask_output: bool = False,
+        mask_threshold: float = 0.5,
+        use_hq_token_only: bool = True,
     ) -> None:
-        self.intensity_ratio = intensity_ratio
-        self.max_radius = max_radius
-        self.dilation_radius = dilation_radius
-        self.min_area = min_area
-        self.min_radius = min_radius
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+        self.model_type = model_type
+        self.requested_device = device
+        self.multimask_output = multimask_output
+        self.mask_threshold = mask_threshold
+        self.use_hq_token_only = use_hq_token_only
         self.model_name = "SAM-HQ"
-        self.model_version = model_version
-        self._score_normalizer = float(max_radius * max_radius)
+        self.model_version = _package_version()
+        self._predictor: SamPredictor | None = None
 
-    def run(self, image: List[List[float]], peaks: Iterable[Peak]) -> List[MaskInstance]:
-        height = len(image)
-        width = len(image[0]) if height else 0
-        if height == 0 or width == 0:
+    def run(self, image: List[List[float]], peaks: Iterable[Peak]) -> List[MaskInstance]:  # type: ignore[override]
+        if not image:
             return []
-        global_max = max((max(row) for row in image), default=1e-6)
+        predictor = self._get_predictor()
+        if predictor is None:
+            return self._fallback_segmentation(image, peaks)
+        np_image = self._prepare_image(image)
+        predictor.set_image(np_image, image_format="RGB")
+
         instances: List[MaskInstance] = []
         for peak in peaks:
-            mask = self._segment_single(image, peak, width, height, global_max)
-            score = self._score(mask, image, global_max, peak.value)
+            mask_bool, score = self._predict_single(predictor, peak)
             instances.append(
                 MaskInstance(
-                    mask=mask,
+                    mask=mask_bool,
                     center=(peak.x, peak.y),
                     prompt_type="point",
                     score=score,
@@ -108,115 +111,91 @@ class SAMHQSegmenter(BasePromptedSegmenter):
             )
         return instances
 
-    def metadata(self) -> Tuple[str, str]:
-        return self.model_name, self.model_version
+    def _get_predictor(self) -> SamPredictor | None:
+        if self._predictor is not None:
+            return self._predictor
+        if np is None or torch is None:
+            self.model_version = "fallback"
+            return None
+        if SamPredictor is None or not sam_model_registry:
+            self.model_version = "fallback"
+            return None
 
-    def _segment_single(
-        self,
-        image: List[List[float]],
-        peak: Peak,
-        width: int,
-        height: int,
-        global_max: float,
-    ) -> Mask:
-        adaptive_threshold = self._adaptive_threshold(image, peak, width, height, global_max)
-        region = self._region_grow(image, peak, width, height, adaptive_threshold)
-        if self.dilation_radius > 0:
-            region = self._dilate(region, width, height, self.dilation_radius)
-        area = _mask_area(region)
-        if area < self.min_area:
-            radius = max(self.min_radius, self.max_radius // 2)
-            return _circle_mask(peak.x, peak.y, radius, height, width)
-        return region
+        builder = sam_model_registry.get(self.model_type) or sam_model_registry.get("default")
+        if builder is None:
+            raise ValueError(f"Unknown SAM-HQ model type: {self.model_type}")
 
-    def _adaptive_threshold(
-        self,
-        image: List[List[float]],
-        peak: Peak,
-        width: int,
-        height: int,
-        global_max: float,
-    ) -> float:
-        local_values = []
-        radius = 3
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                nx, ny = peak.x + dx, peak.y + dy
-                if _within_bounds(nx, ny, width, height):
-                    local_values.append(image[ny][nx])
-        if not local_values:
-            return max(peak.value * self.intensity_ratio, 0.0)
-        local_values.sort()
-        trim = max(len(local_values) // 6, 1)
-        trimmed = local_values[trim:-trim] if len(local_values) > 2 * trim else local_values
-        baseline = sum(trimmed) / len(trimmed)
-        contrast = peak.value - baseline
-        adaptive = baseline + contrast * self.intensity_ratio
-        adaptive = max(min(adaptive, peak.value), 0.0)
-        if global_max > 0:
-            adaptive = max(adaptive, 0.05 * global_max)
-        return adaptive
+        checkpoint = self._resolve_checkpoint()
+        sam_model = builder(checkpoint=str(checkpoint) if checkpoint else None)
+        device_str = self.requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        sam_model.to(device_str)
+        self._predictor = SamPredictor(sam_model)
+        return self._predictor
 
-    def _region_grow(
-        self,
-        image: List[List[float]],
-        peak: Peak,
-        width: int,
-        height: int,
-        threshold: float,
-    ) -> Mask:
-        mask = _create_empty_mask(height, width)
-        queue: deque[Tuple[int, int]] = deque()
-        queue.append((peak.x, peak.y))
-        visited = set()
-        max_distance_sq = self.max_radius * self.max_radius
-        while queue:
-            x, y = queue.popleft()
-            if (x, y) in visited:
-                continue
-            visited.add((x, y))
-            if not _within_bounds(x, y, width, height):
-                continue
-            if (x - peak.x) ** 2 + (y - peak.y) ** 2 > max_distance_sq:
-                continue
-            value = image[y][x]
-            if value < threshold:
-                continue
-            mask[y][x] = True
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dx == 0 and dy == 0:
-                        continue
-                    nx, ny = x + dx, y + dy
-                    if (nx, ny) not in visited:
-                        queue.append((nx, ny))
-        return mask
+    def _resolve_checkpoint(self) -> Path | None:
+        if self.checkpoint_path is None:
+            return None
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(f"SAM-HQ checkpoint not found: {self.checkpoint_path}")
+        return self.checkpoint_path
 
-    def _dilate(self, mask: Mask, width: int, height: int, radius: int) -> Mask:
-        if radius <= 0:
-            return mask
-        dilated = _create_empty_mask(height, width)
-        for y in range(height):
-            for x in range(width):
-                if not mask[y][x]:
-                    continue
-                for dy in range(-radius, radius + 1):
-                    for dx in range(-radius, radius + 1):
-                        nx, ny = x + dx, y + dy
-                        if _within_bounds(nx, ny, width, height):
-                            dilated[ny][nx] = True
-        return dilated
+    def _prepare_image(self, image: List[List[float]]) -> "np.ndarray":
+        if np is None:
+            raise RuntimeError("NumPy is required to prepare images for SAM-HQ.")
+        array = np.asarray(image, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError("SAM-HQ expects single-channel grayscale inputs.")
+        if array.size == 0:
+            raise ValueError("Input image is empty.")
+        normalized = np.clip(array, 0.0, 1.0)
+        scaled = (normalized * 255.0).astype(np.uint8)
+        rgb = np.stack([scaled, scaled, scaled], axis=-1)
+        return rgb
 
-    def _score(self, mask: Mask, image: List[List[float]], global_max: float, peak_value: float) -> float:
-        area = _mask_area(mask)
-        if area == 0:
-            return 0.0
-        mean_intensity = _mean_intensity(mask, image)
-        intensity_factor = mean_intensity / (global_max + 1e-6)
-        area_factor = min(area / (self._score_normalizer + 1e-6), 1.0)
-        peak_factor = peak_value / (global_max + 1e-6)
-        score = 0.25 + 0.45 * intensity_factor + 0.3 * ((area_factor + peak_factor) / 2.0)
-        return max(0.0, min(score, 1.0))
+    def _predict_single(self, predictor: SamPredictor, peak: Peak) -> Tuple[Mask, float]:
+        if np is None:
+            raise RuntimeError("NumPy is required to run SAM-HQ.")
+        point_coords = np.array([[float(peak.x), float(peak.y)]], dtype=np.float32)
+        point_labels = np.array([1], dtype=np.int32)
+        masks, iou_predictions, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            multimask_output=self.multimask_output,
+            return_logits=False,
+            hq_token_only=self.use_hq_token_only,
+        )
+        if masks.ndim != 3 or iou_predictions.ndim != 1:
+            raise RuntimeError("Unexpected SAM-HQ output shape.")
+        best_index = int(iou_predictions.argmax())
+        mask = masks[best_index] >= self.mask_threshold
+        mask_bool: Mask = mask.astype(bool).tolist()
+        score = float(iou_predictions[best_index])
+        return mask_bool, score
+
+    def _fallback_segmentation(self, image: List[List[float]], peaks: Iterable[Peak]) -> List[MaskInstance]:
+        height = len(image)
+        width = len(image[0]) if height else 0
+        if height == 0 or width == 0:
+            return []
+        # Simple circular masks around peaks as a graceful degradation path.
+        radius = max(4, min(height, width) // 12)
+        instances: List[MaskInstance] = []
+        for peak in peaks:
+            mask = [[False for _ in range(width)] for _ in range(height)]
+            for y in range(max(peak.y - radius, 0), min(peak.y + radius + 1, height)):
+                for x in range(max(peak.x - radius, 0), min(peak.x + radius + 1, width)):
+                    if (x - peak.x) ** 2 + (y - peak.y) ** 2 <= radius ** 2:
+                        mask[y][x] = True
+            instances.append(
+                MaskInstance(
+                    mask=mask,
+                    center=(peak.x, peak.y),
+                    prompt_type="point",
+                    score=0.0,
+                )
+            )
+        return instances
 
 
 PromptedSegmenter = SAMHQSegmenter
+

@@ -41,6 +41,7 @@ class InferenceConfig:
     pipeline_version: str = "rgbd-0.9.3"
     min_area: int = 150
     sampling_step_px: float = 4.0
+    density_weights_path: str | None = None
 
 
 @dataclass
@@ -59,12 +60,14 @@ class BaseInferencePipeline(Pipeline):
         fallback_strategy: Optional[LengthMeasurementStrategy] = None,
         config: Optional[InferenceConfig] = None,
     ) -> None:
+        self.config = config or InferenceConfig()
         self.density_model = density_model or CSRNetDensityModel()
+        if self.config.density_weights_path:
+            self._load_density_weights(self.config.density_weights_path)
         self.segmenter = segmenter or SAMHQSegmenter()
         self.peak_detector = PeakDetector()
         self.measurement_strategy = measurement_strategy or EndToEndMeasurementStrategy()
         self.fallback_strategy = fallback_strategy
-        self.config = config or InferenceConfig()
         self.preprocessor = Preprocessor(self.config.preproc)
         self.qc = QualityController(min_area=self.config.min_area)
         self.density_step = DensityMapGenerator(self.density_model)
@@ -132,6 +135,15 @@ class BaseInferencePipeline(Pipeline):
             processing=processing,
         )
         return output
+
+    def _load_density_weights(self, path: str) -> None:
+        load_fn = getattr(self.density_model, "load_weights", None)
+        if not callable(load_fn):
+            return
+        try:
+            load_fn(path)
+        except NotImplementedError:
+            return
 
     def _measure_instance(
         self,
