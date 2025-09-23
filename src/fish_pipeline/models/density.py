@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import json
 from dataclasses import dataclass
 from math import exp
 from random import Random
+from pathlib import Path
 from typing import Any, Iterable, List, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency guard
@@ -65,6 +67,12 @@ class BaseDensityModel(ABC):
     @abstractmethod
     def predict(self, image: Matrix) -> Matrix:
         raise NotImplementedError
+
+    def save_weights(self, path: str | Path) -> None:
+        raise NotImplementedError(f"{type(self).__name__} does not implement weight serialization")
+
+    def load_weights(self, path: str | Path) -> None:
+        raise NotImplementedError(f"{type(self).__name__} does not implement weight loading")
 
 
 @dataclass
@@ -204,17 +212,7 @@ class CSRNetDensityModel(BaseDensityModel):
             self._warmup(warmup_samples, warmup_epochs)
 
     def train(self, dataset: Iterable[TrainingSample]) -> None:
-        samples = list(dataset)
-        if not samples:
-            raise ValueError("Dataset cannot be empty")
-        if self._fallback_model is not None:
-            self._fallback_model.train(samples)
-            self._scale = getattr(self._fallback_model, "_scale", 1.0)
-            return
-        inputs, targets = self._prepare_tensors(samples)
-        self._run_optimization(inputs, targets, epochs=self.epochs)
-        self._calibrate_scale(inputs, targets)
-        self._is_trained = True
+        self.fit(list(dataset))
 
     def predict(self, image: Matrix) -> Matrix:
         if not image:
@@ -232,6 +230,123 @@ class CSRNetDensityModel(BaseDensityModel):
 
     def metadata(self) -> Tuple[str, str]:
         return self.name, self.version
+
+    def save_weights(self, path: str | Path) -> None:  # type: ignore[override]
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if self._fallback_model is not None:
+            payload = {
+                "name": self.name,
+                "version": self.version,
+                "scale": getattr(self._fallback_model, "_scale", 1.0),
+                "fallback": True,
+            }
+            target.write_text(json.dumps(payload))
+            return
+        if torch is None or self.network is None:
+            raise RuntimeError("PyTorch is required to serialize CSRNet weights")
+        checkpoint = {
+            "model_state": self.network.state_dict(),
+            "optimizer_state": self.optimizer.state_dict() if self.optimizer else None,
+            "scale": self._scale,
+            "last_loss": self._last_loss,
+            "name": self.name,
+            "version": self.version,
+        }
+        torch.save(checkpoint, target)
+
+    def load_weights(self, path: str | Path) -> None:  # type: ignore[override]
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        if self._fallback_model is not None:
+            payload = json.loads(source.read_text())
+            scale = float(payload.get("scale", 1.0))
+            self._fallback_model._scale = scale
+            self._scale = scale
+            self._is_trained = True
+            return
+        if torch is None or self.network is None:
+            raise RuntimeError("PyTorch is required to load CSRNet weights")
+        checkpoint = torch.load(source, map_location=self.device)
+        model_state = checkpoint.get("model_state")
+        if model_state is None:
+            raise ValueError("Invalid checkpoint: missing model_state")
+        self.network.load_state_dict(model_state)
+        optimizer_state = checkpoint.get("optimizer_state")
+        if optimizer_state and self.optimizer is not None:
+            self.optimizer.load_state_dict(optimizer_state)
+        self._scale = float(checkpoint.get("scale", 1.0))
+        last_loss = checkpoint.get("last_loss")
+        self._last_loss = float(last_loss) if last_loss is not None else None
+        self._is_trained = True
+
+    def fit(
+        self,
+        train_dataset: Sequence[TrainingSample],
+        val_dataset: Sequence[TrainingSample] | None = None,
+        checkpoint_dir: Path | None = None,
+        best_filename: str | None = None,
+        last_filename: str | None = None,
+    ) -> None:
+        samples = list(train_dataset)
+        if not samples:
+            raise ValueError("Dataset cannot be empty")
+        if self._fallback_model is not None:
+            self._fallback_model.train(samples)
+            self._scale = getattr(self._fallback_model, "_scale", 1.0)
+            self._is_trained = True
+            if checkpoint_dir is not None and last_filename:
+                last_path = checkpoint_dir / last_filename
+                self.save_weights(last_path)
+                if best_filename:
+                    best_path = checkpoint_dir / best_filename
+                    self.save_weights(best_path)
+            return
+        if torch is None or self.network is None or self.optimizer is None:
+            raise RuntimeError("PyTorch is required for CSRNet training")
+
+        inputs, targets = self._prepare_tensors(samples)
+        val_samples = list(val_dataset) if val_dataset else []
+        epochs = max(1, self.epochs)
+        checkpoint_dir_path = Path(checkpoint_dir) if checkpoint_dir is not None else None
+        if checkpoint_dir_path is not None:
+            checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
+        best_metric: float | None = None
+        best_path = (
+            checkpoint_dir_path / best_filename
+            if checkpoint_dir_path is not None and best_filename
+            else None
+        )
+        last_path = (
+            checkpoint_dir_path / last_filename
+            if checkpoint_dir_path is not None and last_filename
+            else None
+        )
+
+        for _ in range(epochs):
+            self._run_optimization(inputs, targets, epochs=1)
+            self._calibrate_scale(inputs, targets)
+            self._is_trained = True
+            metric_dataset = val_samples if val_samples else samples
+            mae, _ = self._evaluate(metric_dataset)
+            if last_path is not None:
+                self.save_weights(last_path)
+            if best_path is not None and (best_metric is None or mae < best_metric):
+                best_metric = mae
+                self.save_weights(best_path)
+
+    def _evaluate(self, dataset: Sequence[TrainingSample]) -> Tuple[float, float]:
+        errors = []
+        squared_errors = []
+        for image, target in dataset:
+            prediction = self.predict(image)
+            diff = _matrix_sum(prediction) - _matrix_sum(target)
+            errors.append(abs(diff))
+            squared_errors.append(diff * diff)
+        mae = sum(errors) / len(errors) if errors else 0.0
+        rmse = (sum(squared_errors) / len(squared_errors)) ** 0.5 if squared_errors else 0.0
+        return mae, rmse
 
     def _prepare_tensors(self, samples: Sequence[TrainingSample]) -> Tuple[Tensor, Tensor]:
         if torch is None:
