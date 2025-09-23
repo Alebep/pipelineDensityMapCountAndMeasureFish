@@ -18,7 +18,7 @@ from ..data.entities import (
     PipelineInput,
     ProcessingMetadata,
 )
-from ..models.density import BaseDensityModel, LFCNetLikeDensityModel
+from ..models.density import BaseDensityModel, CSRNetDensityModel
 from ..steps.density import DensityMapGenerator
 from ..steps.measurement import (
     EndToEndMeasurementStrategy,
@@ -29,7 +29,7 @@ from ..steps.measurement import (
 from ..steps.peaks import PeakDetector
 from ..steps.preprocessing import Preprocessor, PreprocessingConfig
 from ..steps.qc import QualityController
-from ..steps.segmentation import MaskInstance, PromptedSegmenter
+from ..steps.segmentation import BasePromptedSegmenter, MaskInstance, SAMHQSegmenter
 from ..utils.calibration import DepthProjector
 from .base import Pipeline
 
@@ -54,12 +54,13 @@ class BaseInferencePipeline(Pipeline):
     def __init__(
         self,
         density_model: Optional[BaseDensityModel] = None,
+        segmenter: Optional[BasePromptedSegmenter] = None,
         measurement_strategy: Optional[LengthMeasurementStrategy] = None,
         fallback_strategy: Optional[LengthMeasurementStrategy] = None,
         config: Optional[InferenceConfig] = None,
     ) -> None:
-        self.density_model = density_model or LFCNetLikeDensityModel()
-        self.segmenter = PromptedSegmenter()
+        self.density_model = density_model or CSRNetDensityModel()
+        self.segmenter = segmenter or SAMHQSegmenter()
         self.peak_detector = PeakDetector()
         self.measurement_strategy = measurement_strategy or EndToEndMeasurementStrategy()
         self.fallback_strategy = fallback_strategy
@@ -88,11 +89,17 @@ class BaseInferencePipeline(Pipeline):
             if measurement:
                 measurements.append(measurement)
 
+        if hasattr(self.segmenter, "metadata"):
+            segmenter_name, segmenter_version = self.segmenter.metadata()
+        else:
+            segmenter_name = getattr(self.segmenter, "model_name", type(self.segmenter).__name__)
+            segmenter_version = getattr(self.segmenter, "model_version", "unknown")
+
         models_metadata = ModelsMetadata(
             density_model=self.density_model.name,
             density_model_version=self.density_model.version,
-            sam_model=self.segmenter.model_name,
-            sam_model_version=self.segmenter.model_version,
+            sam_model=segmenter_name,
+            sam_model_version=segmenter_version,
         )
 
         counts = CountsSummary(
@@ -249,17 +256,34 @@ class BaseInferencePipeline(Pipeline):
 
 
 class EndToEndMeasurementPipeline(BaseInferencePipeline):
-    def __init__(self, config: Optional[InferenceConfig] = None) -> None:
+    def __init__(
+        self,
+        density_model: Optional[BaseDensityModel] = None,
+        segmenter: Optional[BasePromptedSegmenter] = None,
+        measurement_strategy: Optional[LengthMeasurementStrategy] = None,
+        config: Optional[InferenceConfig] = None,
+    ) -> None:
         super().__init__(
-            measurement_strategy=EndToEndMeasurementStrategy(),
+            density_model=density_model,
+            segmenter=segmenter,
+            measurement_strategy=measurement_strategy or EndToEndMeasurementStrategy(),
             config=config,
         )
 
 
 class SkeletonMeasurementPipeline(BaseInferencePipeline):
-    def __init__(self, config: Optional[InferenceConfig] = None) -> None:
+    def __init__(
+        self,
+        density_model: Optional[BaseDensityModel] = None,
+        segmenter: Optional[BasePromptedSegmenter] = None,
+        measurement_strategy: Optional[LengthMeasurementStrategy] = None,
+        fallback_strategy: Optional[LengthMeasurementStrategy] = None,
+        config: Optional[InferenceConfig] = None,
+    ) -> None:
         super().__init__(
-            measurement_strategy=SkeletonMeasurementStrategy(),
-            fallback_strategy=EndToEndMeasurementStrategy(),
+            density_model=density_model,
+            segmenter=segmenter,
+            measurement_strategy=measurement_strategy or SkeletonMeasurementStrategy(),
+            fallback_strategy=fallback_strategy or EndToEndMeasurementStrategy(),
             config=config,
         )

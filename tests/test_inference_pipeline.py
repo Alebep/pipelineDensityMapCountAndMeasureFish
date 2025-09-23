@@ -14,6 +14,8 @@ from fish_pipeline.pipelines.inference import (
     InferenceRequest,
     SkeletonMeasurementPipeline,
 )
+from fish_pipeline.models.density import BaseDensityModel
+from fish_pipeline.steps.segmentation import BasePromptedSegmenter, MaskInstance
 
 
 def make_meta(width: int, height: int) -> PipelineInput:
@@ -68,7 +70,7 @@ def test_end_to_end_pipeline_output_structure():
 
     assert output.counts.total_detected >= 2
     assert output.counts.total_measured == len(output.measurements)
-    assert output.models.density_model == "LFCNet"
+    assert output.models.density_model == "CSRNet"
     assert all(measure.length.method == "end_to_end" for measure in output.measurements)
 
     result_dict = output.to_dict()
@@ -89,3 +91,50 @@ def test_skeleton_pipeline_uses_fallback_when_needed():
     pipeline.measurement_strategy = FailingStrategy()
     output = pipeline.run(request)
     assert all(measure.length.method == "end_to_end" for measure in output.measurements)
+
+
+def test_pipeline_accepts_custom_models():
+    request = make_test_request()
+
+    class DummyDensityModel(BaseDensityModel):
+        def __init__(self) -> None:
+            self.name = "DummyDensity"
+            self.version = "test"
+
+        def train(self, dataset):
+            return None
+
+        def predict(self, image):
+            return image
+
+    class DummySegmenter(BasePromptedSegmenter):
+        model_name = "DummySegmenter"
+        model_version = "1.0"
+
+        def run(self, image, peaks):
+            height = len(image)
+            width = len(image[0]) if height else 0
+            instances: list[MaskInstance] = []
+            for peak in peaks:
+                mask = [[False for _ in range(width)] for _ in range(height)]
+                radius = 4
+                for y in range(max(peak.y - radius, 0), min(peak.y + radius + 1, height)):
+                    for x in range(max(peak.x - radius, 0), min(peak.x + radius + 1, width)):
+                        if (x - peak.x) ** 2 + (y - peak.y) ** 2 <= radius ** 2:
+                            mask[y][x] = True
+                instances.append(
+                    MaskInstance(mask=mask, center=(peak.x, peak.y), prompt_type="point", score=0.9)
+                )
+            return instances
+
+    pipeline = EndToEndMeasurementPipeline(
+        density_model=DummyDensityModel(),
+        segmenter=DummySegmenter(),
+        config=InferenceConfig(),
+    )
+
+    output = pipeline.run(request)
+
+    assert output.models.density_model == "DummyDensity"
+    assert output.models.sam_model == "DummySegmenter"
+    assert output.counts.total_detected == len(output.measurements) >= 1
